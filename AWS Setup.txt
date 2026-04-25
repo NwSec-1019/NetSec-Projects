@@ -1,0 +1,153 @@
+#!/bin/bash
+
+set -e
+
+REGION="ap-south-1"
+AZ1="ap-south-1a"
+AZ2="ap-south-1b"
+
+# CIDRs
+SEC_VPC_CIDR="10.0.0.0/16"
+PROD1_VPC_CIDR="10.1.0.0/16"
+PROD2_VPC_CIDR="10.2.0.0/16"
+
+echo "==== CREATE VPCS ===="
+
+SEC_VPC=$(aws ec2 create-vpc --cidr-block $SEC_VPC_CIDR --query 'Vpc.VpcId' --output text)
+PROD1_VPC=$(aws ec2 create-vpc --cidr-block $PROD1_VPC_CIDR --query 'Vpc.VpcId' --output text)
+PROD2_VPC=$(aws ec2 create-vpc --cidr-block $PROD2_VPC_CIDR --query 'Vpc.VpcId' --output text)
+
+echo "SEC_VPC=$SEC_VPC"
+echo "PROD1_VPC=$PROD1_VPC"
+echo "PROD2_VPC=$PROD2_VPC"
+
+for VPC in $SEC_VPC $PROD1_VPC $PROD2_VPC; do
+  aws ec2 modify-vpc-attribute --vpc-id $VPC --enable-dns-support "{\"Value\":true}"
+  aws ec2 modify-vpc-attribute --vpc-id $VPC --enable-dns-hostnames "{\"Value\":true}"
+done
+
+echo "==== CREATE SUBNETS ===="
+
+SEC_SUBNET_A=$(aws ec2 create-subnet --vpc-id $SEC_VPC --cidr-block 10.0.1.0/24 --availability-zone $AZ1 --query 'Subnet.SubnetId' --output text)
+SEC_SUBNET_B=$(aws ec2 create-subnet --vpc-id $SEC_VPC --cidr-block 10.0.2.0/24 --availability-zone $AZ2 --query 'Subnet.SubnetId' --output text)
+
+PROD1_SUBNET_A=$(aws ec2 create-subnet --vpc-id $PROD1_VPC --cidr-block 10.1.1.0/24 --availability-zone $AZ1 --query 'Subnet.SubnetId' --output text)
+PROD1_SUBNET_B=$(aws ec2 create-subnet --vpc-id $PROD1_VPC --cidr-block 10.1.2.0/24 --availability-zone $AZ2 --query 'Subnet.SubnetId' --output text)
+
+PROD2_SUBNET_A=$(aws ec2 create-subnet --vpc-id $PROD2_VPC --cidr-block 10.2.1.0/24 --availability-zone $AZ1 --query 'Subnet.SubnetId' --output text)
+PROD2_SUBNET_B=$(aws ec2 create-subnet --vpc-id $PROD2_VPC --cidr-block 10.2.2.0/24 --availability-zone $AZ2 --query 'Subnet.SubnetId' --output text)
+
+echo "==== CREATE IGW (SECURITY VPC) ===="
+
+IGW=$(aws ec2 create-internet-gateway --query 'InternetGateway.InternetGatewayId' --output text)
+aws ec2 attach-internet-gateway --internet-gateway-id $IGW --vpc-id $SEC_VPC
+
+SEC_RT=$(aws ec2 create-route-table --vpc-id $SEC_VPC --query 'RouteTable.RouteTableId' --output text)
+aws ec2 create-route --route-table-id $SEC_RT --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW
+
+aws ec2 associate-route-table --subnet-id $SEC_SUBNET_A --route-table-id $SEC_RT
+aws ec2 associate-route-table --subnet-id $SEC_SUBNET_B --route-table-id $SEC_RT
+
+echo "==== CREATE TGW ===="
+
+TGW=$(aws ec2 create-transit-gateway --description "Central TGW" --query 'TransitGateway.TransitGatewayId' --output text)
+
+echo "TGW=$TGW"
+
+echo "==== ATTACH VPCS TO TGW ===="
+
+SEC_ATTACH=$(aws ec2 create-transit-gateway-vpc-attachment \
+  --transit-gateway-id $TGW \
+  --vpc-id $SEC_VPC \
+  --subnet-ids $SEC_SUBNET_A $SEC_SUBNET_B \
+  --query 'TransitGatewayVpcAttachment.TransitGatewayAttachmentId' \
+  --output text)
+
+PROD1_ATTACH=$(aws ec2 create-transit-gateway-vpc-attachment \
+  --transit-gateway-id $TGW \
+  --vpc-id $PROD1_VPC \
+  --subnet-ids $PROD1_SUBNET_A $PROD1_SUBNET_B \
+  --query 'TransitGatewayVpcAttachment.TransitGatewayAttachmentId' \
+  --output text)
+
+PROD2_ATTACH=$(aws ec2 create-transit-gateway-vpc-attachment \
+  --transit-gateway-id $TGW \
+  --vpc-id $PROD2_VPC \
+  --subnet-ids $PROD2_SUBNET_A $PROD2_SUBNET_B \
+  --query 'TransitGatewayVpcAttachment.TransitGatewayAttachmentId' \
+  --output text)
+
+echo "==== TGW ROUTE TABLES (CRITICAL) ===="
+
+TGW_RT=$(aws ec2 create-transit-gateway-route-table \
+  --transit-gateway-id $TGW \
+  --query 'TransitGatewayRouteTable.TransitGatewayRouteTableId' \
+  --output text)
+
+aws ec2 associate-transit-gateway-route-table \
+  --transit-gateway-attachment-id $PROD1_ATTACH \
+  --transit-gateway-route-table-id $TGW_RT
+
+aws ec2 associate-transit-gateway-route-table \
+  --transit-gateway-attachment-id $PROD2_ATTACH \
+  --transit-gateway-route-table-id $TGW_RT
+
+aws ec2 create-transit-gateway-route \
+  --transit-gateway-route-table-id $TGW_RT \
+  --destination-cidr-block 0.0.0.0/0 \
+  --transit-gateway-attachment-id $SEC_ATTACH
+
+echo "==== CREATE GWLB ===="
+
+TG_ARN=$(aws elbv2 create-target-group \
+  --name gwlb-tg \
+  --protocol GENEVE \
+  --port 6081 \
+  --vpc-id $SEC_VPC \
+  --target-type instance \
+  --query 'TargetGroups[0].TargetGroupArn' \
+  --output text)
+
+GWLB_ARN=$(aws elbv2 create-load-balancer \
+  --name gwlb \
+  --type gateway \
+  --subnets $SEC_SUBNET_A $SEC_SUBNET_B \
+  --query 'LoadBalancers[0].LoadBalancerArn' \
+  --output text)
+
+aws elbv2 create-listener \
+  --load-balancer-arn $GWLB_ARN \
+  --default-actions Type=forward,TargetGroupArn=$TG_ARN
+
+echo "==== CREATE GWLBe (SPOKE VPCS) ===="
+
+SERVICE_NAME=$(aws elbv2 describe-load-balancers \
+  --load-balancer-arns $GWLB_ARN \
+  --query 'LoadBalancers[0].DNSName' \
+  --output text)
+
+aws ec2 create-vpc-endpoint \
+  --vpc-id $PROD1_VPC \
+  --service-name com.amazonaws.$REGION.gwlb \
+  --vpc-endpoint-type GatewayLoadBalancer \
+  --subnet-ids $PROD1_SUBNET_A
+
+aws ec2 create-vpc-endpoint \
+  --vpc-id $PROD1_VPC \
+  --service-name com.amazonaws.$REGION.gwlb \
+  --vpc-endpoint-type GatewayLoadBalancer \
+  --subnet-ids $PROD1_SUBNET_B
+
+aws ec2 create-vpc-endpoint \
+  --vpc-id $PROD2_VPC \
+  --service-name com.amazonaws.$REGION.gwlb \
+  --vpc-endpoint-type GatewayLoadBalancer \
+  --subnet-ids $PROD2_SUBNET_A
+
+aws ec2 create-vpc-endpoint \
+  --vpc-id $PROD2_VPC \
+  --service-name com.amazonaws.$REGION.gwlb \
+  --vpc-endpoint-type GatewayLoadBalancer \
+  --subnet-ids $PROD2_SUBNET_B
+
+echo "==== DONE ===="
